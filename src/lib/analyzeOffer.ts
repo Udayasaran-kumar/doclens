@@ -3,12 +3,33 @@ import { type Analysis, type DateItem, type MoneyItem, type PersonOrg, emptyAnal
 const MONTHS =
   "January|February|March|April|May|June|July|August|September|October|November|December"
 
+const ORG_WORD = "(?!Pvt\\b|Ltd\\b|Inc\\b|LLC\\b|LLP\\b|Limited\\b|Corp\\b|Corporation\\b)[A-Z][A-Za-z0-9&'-]*"
+const ORG_SUFFIX = "Pvt\\.|Ltd\\.|Inc\\.|LLC|LLP|Limited|Corp\\.|Corporation"
+const ORGANIZATION = `${ORG_WORD}(?: ${ORG_WORD})*(?: (?:${ORG_SUFFIX}))*`
+const ROLE = "[A-Z][a-z]+(?: [A-Z][a-z]+)*"
+const NAME_WORD = "[A-Z][a-z]+"
+const FULL_NAME = `${NAME_WORD}(?: ${NAME_WORD})+`
+const GIVEN_NAME = `${NAME_WORD}(?: ${NAME_WORD})*`
+
+const NAME_STOP = new Set([
+  "Subject",
+  "Offer",
+  "Dear",
+  "Date",
+  "Your",
+  "Please",
+  "Sincerely",
+  "Engineering",
+  "Manager",
+  "Employment",
+])
+
 function datePattern(): RegExp {
   return new RegExp(`\\b(?:${MONTHS})\\s+\\d{1,2},\\s+\\d{4}\\b|\\b\\d{4}-\\d{2}-\\d{2}\\b`, "g")
 }
 
 function moneyPattern(): RegExp {
-  return /\$\s?\d{1,3}(?:,\d{3})+(?:\.\d{2})?/g
+  return /(?:₹|(?<![A-Za-z])(?:INR|Rs\.?)|\$)\s?\d{1,3}(?:,\d{2,3})+(?:\.\d{2})?/g
 }
 
 function sentencesOf(text: string): string[] {
@@ -41,17 +62,30 @@ function isOpeningDate(text: string, index: number): boolean {
   return text.indexOf(match[0]) === index
 }
 
+function isOfferDateContext(localBefore: string): boolean {
+  if (/\b(?:offer\s+date|date\s+of\s+offer|date)\s*:\s*$/i.test(localBefore)) return true
+  if (/\bdated\s*$/i.test(localBefore)) return true
+  if (/\boffer\s+letter\b/i.test(localBefore)) return true
+  return false
+}
+
+function sameSentenceAfter(text: string, index: number, date: string): string {
+  const raw = text.slice(index + date.length, index + date.length + 36)
+  const breakAt = raw.search(/[.!?]|\n\s*\n/)
+  return breakAt >= 0 ? raw.slice(0, breakAt) : raw
+}
+
 function labelDate(text: string, index: number, date: string): string {
   if (isOpeningDate(text, index)) return "Offer date"
   const before = text.slice(Math.max(0, index - 90), index)
   const sentenceBreak = Math.max(before.lastIndexOf("."), before.lastIndexOf("!"), before.lastIndexOf("?"))
   const localBefore = sentenceBreak >= 0 ? before.slice(sentenceBreak + 1) : before
-  const localAfter = text.slice(index + date.length, index + date.length + 36)
+  const localAfter = sameSentenceAfter(text, index, date)
   const local = `${localBefore}${date}${localAfter}`
   if (/\b(submit|documents)\b/i.test(localBefore)) return "Other date"
   if (/\bstart date\b/i.test(local)) return "Start date"
   if (/\b(accept|acceptance|respond by)\b/i.test(local)) return "Acceptance deadline"
-  if (/\boffer date\b/i.test(local)) return "Offer date"
+  if (isOfferDateContext(localBefore)) return "Offer date"
   return "Other date"
 }
 
@@ -82,7 +116,7 @@ function findMoney(text: string): MoneyItem[] {
     if (match.index === undefined) continue
     amounts.push({
       label: labelMoney(sentenceAt(text, match.index)),
-      amount: match[0].replace(/\s+/g, ""),
+      amount: match[0],
     })
   }
   return amounts
@@ -96,14 +130,63 @@ function findActions(text: string): string[] {
   )
 }
 
-function findPeople(text: string): { people: PersonOrg[]; roleTitle: string | null; company: string | null; candidate: string | null } {
-  const candidate = text.match(/Dear ([A-Z][a-z]+(?: [A-Z][a-z]+)+)/)?.[1] ?? null
-  const company = text.match(/([A-Z][a-z]+(?: [A-Z][a-z]+)*) is pleased to offer/)?.[1] ?? null
-  const roleTitle = text.match(/the role of ([A-Z][a-z]+(?: [A-Z][a-z]+)*)/)?.[1] ?? null
-  const other =
-    text.match(/hiring manager, ([A-Z][a-z]+(?: [A-Z][a-z]+)+)/i)?.[1] ??
-    text.match(/recruiter, ([A-Z][a-z]+(?: [A-Z][a-z]+)+)/i)?.[1] ??
-    null
+function trimName(raw: string, minWords: number): string | null {
+  const kept: string[] = []
+  for (const word of raw.split(/\s+/)) {
+    if (!/^[A-Z][a-z]+$/.test(word) || NAME_STOP.has(word)) break
+    kept.push(word)
+    if (kept.length === 4) break
+  }
+  if (kept.length < minWords) return null
+  return kept.join(" ")
+}
+
+function captureName(text: string, pattern: RegExp, minWords: number): string | null {
+  const raw = text.match(pattern)?.[1]
+  if (!raw) return null
+  return trimName(raw, minWords)
+}
+
+function findCandidate(text: string): string | null {
+  const addressed = captureName(text, new RegExp(`\\bTo:\\s*(${FULL_NAME}(?: ${NAME_WORD}){0,2})`, "i"), 2)
+  const dear = captureName(text, new RegExp(`\\bDear\\s+(${GIVEN_NAME})`, "i"), 1)
+  if (addressed && dear && (addressed === dear || addressed.startsWith(`${dear} `))) return addressed
+  return addressed ?? dear
+}
+
+function findCompany(text: string): string | null {
+  const pleased = text.match(new RegExp(`(${ORGANIZATION}) is pleased to offer`))?.[1] ?? null
+  if (pleased) return pleased
+  return text.match(new RegExp(`the (?:role|position) of ${ROLE} at (${ORGANIZATION})`))?.[1] ?? null
+}
+
+function findRole(text: string): string | null {
+  const labeled = text.match(new RegExp(`the (?:role|position) of (${ROLE})`))?.[1] ?? null
+  if (labeled) return labeled
+  return text.match(new RegExp(`Offer of Employment\\s+[—–-]\\s+(${ROLE})`))?.[1] ?? null
+}
+
+function findOtherPerson(text: string): string | null {
+  return captureName(
+    text,
+    new RegExp(
+      `\\b(?:hiring manager|reporting manager|recruiter)(?:,| will be)\\s*(${FULL_NAME}(?: ${NAME_WORD}){0,2})`,
+      "i",
+    ),
+    2,
+  )
+}
+
+function findPeople(text: string): {
+  people: PersonOrg[]
+  roleTitle: string | null
+  company: string | null
+  candidate: string | null
+} {
+  const candidate = findCandidate(text)
+  const company = findCompany(text)
+  const roleTitle = findRole(text)
+  const other = findOtherPerson(text)
 
   const people: PersonOrg[] = []
   if (candidate) people.push({ name: candidate, role: "candidate" })
@@ -113,9 +196,10 @@ function findPeople(text: string): { people: PersonOrg[]; roleTitle: string | nu
 }
 
 function benefitsNote(text: string): string | null {
-  const sentence = sentencesOf(text).find(
-    (item) => /medical|dental|paid vacation/i.test(item) && !/\$/.test(item),
-  )
+  const sentence = sentencesOf(text).find((item) => {
+    if (!/medical|dental|paid vacation/i.test(item)) return false
+    return !moneyPattern().test(item)
+  })
   return sentence ?? null
 }
 

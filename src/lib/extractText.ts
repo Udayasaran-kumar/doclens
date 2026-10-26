@@ -10,7 +10,10 @@ export async function extractFileText(file: File): Promise<string> {
 }
 
 async function extractDocx(data: ArrayBuffer): Promise<string> {
-  const result = await mammoth.extractRawText({ arrayBuffer: data })
+  const result = await mammoth.extractRawText({
+    arrayBuffer: data,
+    buffer: new Uint8Array(data),
+  } as Parameters<typeof mammoth.extractRawText>[0])
   return result.value
 }
 
