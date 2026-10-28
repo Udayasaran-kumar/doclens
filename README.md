@@ -41,6 +41,17 @@ npm run build
 
 `npm run preview` serves the production build locally.
 
+## Architecture
+
+A file is read in the browser. `extractText` pulls text from PDF, DOCX, or TXT. `analyzeOffer` fills summary, dates, money, actions, and people only from spans it can support. The React screen renders that result. Nothing is sent to a model API.
+
+```mermaid
+flowchart LR
+  File[PDF DOCX or TXT] --> Extract[extractText]
+  Extract --> Read[analyzeOffer]
+  Read --> Screen[Results]
+```
+
 ## What this proof leaves out
 
 Accounts, a database, document history, a server, a model API, and separate workflows for other document types.
